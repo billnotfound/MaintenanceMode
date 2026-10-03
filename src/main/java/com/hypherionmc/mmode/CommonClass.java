@@ -16,6 +16,7 @@ import com.hypherionmc.craterlib.impl.api.network.protocol.status.WrappedServerS
 import com.hypherionmc.mmode.commands.MaintenanceModeCommand;
 import com.hypherionmc.mmode.config.MaintenanceModeConfig;
 import com.hypherionmc.mmode.schedule.MaintenanceSchedule;
+import com.hypherionmc.mmode.util.MaintenanceDialog;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 
@@ -43,6 +44,7 @@ public final class CommonClass {
     public void serverStartedEvent(CraterServerLifecycleEvent.Started event) {
         new MaintenanceModeConfig();
         mcServer = event.getServer();
+        MaintenanceDialog.shutdown();
         MaintenanceSchedule.INSTANCE.initScheduler();
 
         loadIcons();
@@ -63,6 +65,11 @@ public final class CommonClass {
             // Check if maintenance mode is enabled and kick the player
             if (MaintenanceModeConfig.INSTANCE.isEnabled()) {
                 if (isNotAllowedToJoin(event.getGameProfile())) {
+                    // On versions with dialog support, hold the player in the configuration phase
+                    // and show the maintenance message as a dialog, so links are clickable
+                    if (MaintenanceDialog.hold(mcServer, event.getGameProfile(), event.getAddress()))
+                        return;
+
                     String message = MaintenanceModeConfig.INSTANCE.getMessage();
                     if (message == null || message.isEmpty())
                         message = "Server is currently undergoing maintenance. Please try connecting again later";
@@ -76,7 +83,7 @@ public final class CommonClass {
         }
     }
 
-    private boolean isNotAllowedToJoin(CraterGameProfile player) {
+    public static boolean isNotAllowedToJoin(CraterGameProfile player) {
         if (!MaintenanceModeConfig.INSTANCE.getAllowedLuckpermsGroups().isEmpty() && CraterLoader.isModLoaded("luckperms")) {
             for (String group : MaintenanceModeConfig.INSTANCE.getAllowedLuckpermsGroups()) {
                 if (LuckPermsCompat.getInstance().hasGroup(player.getId(), group))
@@ -121,6 +128,7 @@ public final class CommonClass {
 
     @CraterEventListener
     public void serverShutdownEvent(CraterServerLifecycleEvent.Stopped event) {
+        MaintenanceDialog.shutdown();
         executor.shutdownNow();
         if (resetOnStartup && MaintenanceModeConfig.INSTANCE.isEnabled()) {
             MaintenanceModeConfig.INSTANCE.setEnabled(false);
