@@ -8,6 +8,10 @@ import com.hypherionmc.craterlib.api.game.text.Text;
 import com.hypherionmc.mmode.CommonClass;
 import com.hypherionmc.mmode.ModConstants;
 import com.hypherionmc.mmode.config.MaintenanceModeConfig;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPipeline;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -63,8 +67,18 @@ public final class MaintenanceDialog {
     private static final String METHOD_GET_PACKET_LISTENER_INTERMEDIARY = "method_10744";
     private static final String METHOD_SEND = "send";
     private static final String METHOD_SEND_INTERMEDIARY = "method_10743";
+    private static final String METHOD_DISCONNECT = "disconnect";
+    private static final String METHOD_DISCONNECT_INTERMEDIARY = "method_52396";
 
     private static final String CLASS_GAME_PROFILE = "com.mojang.authlib.GameProfile";
+    private static final String CLASS_COMPONENT = "net.minecraft.network.chat.Component";
+    private static final String CLASS_COMPONENT_INTERMEDIARY = "net.minecraft.class_2561";
+    private static final String CLASS_CUSTOM_ACTION_PACKET = "net.minecraft.network.protocol.common.ServerboundCustomClickActionPacket";
+    private static final String CLASS_CUSTOM_ACTION_PACKET_INTERMEDIARY = "net.minecraft.class_11411";
+
+    private static final String CHANNEL_HANDLER_NAME = "packet_handler";
+    private static final String CLOSE_PROBE_NAME = "mmode_dialog_close";
+    private static final String CLOSE_ACTION_ID = "mmode:close";
 
     private static final String DFU_CODEC = "com.mojang.serialization.Codec";
     private static final String DFU_DECODER = "com.mojang.serialization.Decoder";
@@ -191,12 +205,16 @@ public final class MaintenanceDialog {
         long now = System.currentTimeMillis();
 
         for (PendingDialog pending : PENDING.values()) {
-            if (now > pending.deadline || !stillDenied(pending)) {
-                PENDING.remove(pending.address);
+            if (pending.dispatched.get()) {
+                if (now >= pending.kickAt) {
+                    disconnectHeldConnection(pending);
+                    PENDING.remove(pending.address);
+                }
                 continue;
             }
 
-            if (pending.dispatched.get()) {
+            if (now > pending.deadline || !stillDenied(pending)) {
+                PENDING.remove(pending.address);
                 continue;
             }
 
@@ -212,7 +230,7 @@ public final class MaintenanceDialog {
 
             if (isConfigurationListener(listener)) {
                 if (pending.dispatched.compareAndSet(false, true)) {
-                    dispatchDialog(serverHandle, connection, listener);
+                    dispatchDialog(serverHandle, connection, listener, pending);
                 }
             } else if (isPlayerOnline(server, pending.profile)) {
                 // Safety net: the player somehow made it into the game while maintenance denies them
@@ -327,7 +345,7 @@ public final class MaintenanceDialog {
         }
     }
 
-    private static void dispatchDialog(Object serverHandle, Object connection, Object listener) {
+    private static void dispatchDialog(Object serverHandle, Object connection, Object listener, PendingDialog pending) {
         Object packet;
 
         try {
@@ -345,10 +363,88 @@ public final class MaintenanceDialog {
                 Method send = findMethod(connection.getClass(), METHOD_SEND, METHOD_SEND_INTERMEDIARY, packetClass);
                 send.invoke(connection, packet);
                 clearConfigurationTasks(listener);
+
+                pending.connection = connection;
+                pending.listener = listener;
+
+                int timeout = MaintenanceModeConfig.INSTANCE.getDialogTimeout();
+                pending.kickAt = timeout > 0 ? System.currentTimeMillis() + timeout * 1000L : Long.MAX_VALUE;
+
+                installCloseProbe(serverHandle, pending);
             } catch (Throwable t) {
                 ModConstants.LOG.error("Failed to show the maintenance dialog: {}", t.getMessage());
             }
         });
+    }
+
+    /**
+     * Watches the connection for the custom click action that the dialog's close button sends.
+     * That way the player gets kicked as soon as the dialog is closed instead of being held in
+     * the configuration phase.
+     */
+    private static void installCloseProbe(Object serverHandle, PendingDialog pending) {
+        try {
+            Object connection = pending.connection;
+            Field channelField = connection == null ? null : findFieldByType(connection.getClass(), Class.forName("io.netty.channel.Channel"));
+            Channel channel = channelField == null ? null : (Channel) channelField.get(connection);
+
+            if (channel == null || !channel.isOpen()) {
+                return;
+            }
+
+            ChannelPipeline pipeline = channel.pipeline();
+
+            if (pipeline.get(CLOSE_PROBE_NAME) != null || pipeline.get(CHANNEL_HANDLER_NAME) == null) {
+                return;
+            }
+
+            pipeline.addBefore(CHANNEL_HANDLER_NAME, CLOSE_PROBE_NAME, new ChannelInboundHandlerAdapter() {
+                @Override
+                public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                    try {
+                        String packetClass = msg.getClass().getName();
+
+                        if (CLASS_CUSTOM_ACTION_PACKET.equals(packetClass) || CLASS_CUSTOM_ACTION_PACKET_INTERMEDIARY.equals(packetClass)) {
+                            ctx.pipeline().remove(this);
+                            onDialogClosed(serverHandle, pending);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+
+                    super.channelRead(ctx, msg);
+                }
+            });
+        } catch (Throwable t) {
+            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
+                ModConstants.LOG.error("Failed to install the dialog close listener", t);
+            }
+        }
+    }
+
+    private static void onDialogClosed(Object serverHandle, PendingDialog pending) {
+        executeOnServer(serverHandle, () -> {
+            if (PENDING.remove(pending.address) != null) {
+                disconnectHeldConnection(pending);
+            }
+        });
+    }
+
+    private static void disconnectHeldConnection(PendingDialog pending) {
+        try {
+            Object listener = pending.listener;
+
+            if (listener == null) {
+                return;
+            }
+
+            Class<?> componentClass = resolveClass(CLASS_COMPONENT, CLASS_COMPONENT_INTERMEDIARY);
+            Method disconnect = findMethod(listener.getClass(), METHOD_DISCONNECT, METHOD_DISCONNECT_INTERMEDIARY, componentClass);
+            disconnect.invoke(listener, Text.formatted(getMaintenanceMessage()).toGame());
+        } catch (Throwable t) {
+            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
+                ModConstants.LOG.error("Failed to disconnect player after closing the maintenance dialog", t);
+            }
+        }
     }
 
     private static void clearConfigurationTasks(Object listener) throws Exception {
@@ -394,7 +490,17 @@ public final class MaintenanceDialog {
 
         JsonObject dialog = new JsonObject();
         dialog.addProperty("type", links.isEmpty() ? "minecraft:notice" : "minecraft:multi_action");
+        dialog.addProperty("pause", false);
+        dialog.addProperty("after_action", "none");
         dialog.add("title", Text.formatted(title).toJson());
+
+        JsonObject closeAction = new JsonObject();
+        closeAction.addProperty("type", "minecraft:custom");
+        closeAction.addProperty("id", CLOSE_ACTION_ID);
+
+        JsonObject closeButton = new JsonObject();
+        closeButton.add("label", Text.translatable("gui.done").toJson());
+        closeButton.add("action", closeAction);
 
         JsonObject plainMessage = new JsonObject();
         plainMessage.addProperty("type", "minecraft:plain_message");
@@ -405,7 +511,9 @@ public final class MaintenanceDialog {
         body.add(plainMessage);
         dialog.add("body", body);
 
-        if (!links.isEmpty()) {
+        if (links.isEmpty()) {
+            dialog.add("action", closeButton);
+        } else {
             JsonArray actions = new JsonArray();
 
             for (MaintenanceModeConfig.DialogLink link : links) {
@@ -421,6 +529,7 @@ public final class MaintenanceDialog {
             }
 
             dialog.add("actions", actions);
+            dialog.add("exit_action", closeButton);
         }
 
         return dialog;
@@ -525,6 +634,9 @@ public final class MaintenanceDialog {
         private final SocketAddress address;
         private final long deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS;
         private final AtomicBoolean dispatched = new AtomicBoolean(false);
+        private volatile Object connection;
+        private volatile Object listener;
+        private volatile long kickAt = Long.MAX_VALUE;
 
         private PendingDialog(CraterGameProfile profile, SocketAddress address) {
             this.profile = profile;
