@@ -1,5 +1,7 @@
 package com.hypherionmc.mmode.util;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.hypherionmc.craterlib.api.game.authlib.CraterGameProfile;
 import com.hypherionmc.craterlib.api.game.server.CraterGameServer;
 import com.hypherionmc.craterlib.api.game.text.Text;
@@ -9,6 +11,9 @@ import com.hypherionmc.mmode.config.MaintenanceModeConfig;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.net.SocketAddress;
 import java.net.URI;
 import java.util.List;
@@ -32,25 +37,40 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * dialog support everything falls back to the old text kick.
  * <p>
  * Every Minecraft class is accessed by name through reflection, so this class is safe to load on
- * old versions where dialogs do not exist.
+ * old versions where dialogs do not exist. Official (Mojang) class and method names are used
+ * first. Fabric/Quilt 1.21.6 - 1.21.11 use intermediary names, so those are included as a
+ * fallback. Intermediary names are stable between those versions.
  */
 public final class MaintenanceDialog {
 
     private static final String CLASS_DIALOG = "net.minecraft.server.dialog.Dialog";
+    private static final String CLASS_DIALOG_INTERMEDIARY = "net.minecraft.class_11419";
     private static final String CLASS_SHOW_DIALOG_PACKET = "net.minecraft.network.protocol.common.ClientboundShowDialogPacket";
-    private static final String CLASS_CONFIGURATION_LISTENER = "net.minecraft.server.network.ServerConfigurationPacketListenerImpl";
-    private static final String CLASS_PACKET = "net.minecraft.network.protocol.Packet";
+    private static final String CLASS_SHOW_DIALOG_PACKET_INTERMEDIARY = "net.minecraft.class_11407";
     private static final String CLASS_HOLDER = "net.minecraft.core.Holder";
-    private static final String CLASS_COMPONENT = "net.minecraft.network.chat.Component";
-    private static final String CLASS_COMPONENT_SERIALIZATION = "net.minecraft.network.chat.ComponentSerialization";
-    private static final String CLASS_NBT_OPS = "net.minecraft.nbt.NbtOps";
-    private static final String CLASS_COMPOUND_TAG = "net.minecraft.nbt.CompoundTag";
-    private static final String CLASS_LIST_TAG = "net.minecraft.nbt.ListTag";
-    private static final String CLASS_TAG = "net.minecraft.nbt.Tag";
-    private static final String CLASS_DECODER = "com.mojang.serialization.Decoder";
-    private static final String CLASS_ENCODER = "com.mojang.serialization.Encoder";
-    private static final String CLASS_DYNAMIC_OPS = "com.mojang.serialization.DynamicOps";
-    private static final String CLASS_DATA_RESULT = "com.mojang.serialization.DataResult";
+    private static final String CLASS_HOLDER_INTERMEDIARY = "net.minecraft.class_6880";
+    private static final String CLASS_PACKET = "net.minecraft.network.protocol.Packet";
+    private static final String CLASS_PACKET_INTERMEDIARY = "net.minecraft.class_2596";
+    private static final String CLASS_CONFIGURATION_LISTENER = "net.minecraft.server.network.ServerConfigurationPacketListenerImpl";
+    private static final String CLASS_CONFIGURATION_LISTENER_INTERMEDIARY = "net.minecraft.class_8610";
+
+    private static final String METHOD_GET_CONNECTION = "getConnection";
+    private static final String METHOD_GET_CONNECTION_INTERMEDIARY = "method_3787";
+    private static final String METHOD_GET_CONNECTIONS_INTERMEDIARY = "method_37909";
+    private static final String METHOD_GET_REMOTE_ADDRESS = "getRemoteAddress";
+    private static final String METHOD_GET_REMOTE_ADDRESS_INTERMEDIARY = "method_10755";
+    private static final String METHOD_GET_PACKET_LISTENER = "getPacketListener";
+    private static final String METHOD_GET_PACKET_LISTENER_INTERMEDIARY = "method_10744";
+    private static final String METHOD_SEND = "send";
+    private static final String METHOD_SEND_INTERMEDIARY = "method_10743";
+
+    private static final String CLASS_GAME_PROFILE = "com.mojang.authlib.GameProfile";
+
+    private static final String DFU_CODEC = "com.mojang.serialization.Codec";
+    private static final String DFU_DECODER = "com.mojang.serialization.Decoder";
+    private static final String DFU_DYNAMIC_OPS = "com.mojang.serialization.DynamicOps";
+    private static final String DFU_JSON_OPS = "com.mojang.serialization.JsonOps";
+    private static final String DFU_DATA_RESULT = "com.mojang.serialization.DataResult";
 
     private static final long WAIT_TIMEOUT_MS = 30000L;
     private static final long POLL_INTERVAL_MS = 25L;
@@ -70,10 +90,10 @@ public final class MaintenanceDialog {
     public static boolean isSupported() {
         if (supported == null) {
             try {
-                Class.forName(CLASS_DIALOG);
-                Class.forName(CLASS_SHOW_DIALOG_PACKET);
-                Class.forName(CLASS_CONFIGURATION_LISTENER);
-                Class.forName(CLASS_NBT_OPS);
+                resolveClass(CLASS_DIALOG, CLASS_DIALOG_INTERMEDIARY);
+                resolveClass(CLASS_SHOW_DIALOG_PACKET, CLASS_SHOW_DIALOG_PACKET_INTERMEDIARY);
+                resolveClass(CLASS_CONFIGURATION_LISTENER, CLASS_CONFIGURATION_LISTENER_INTERMEDIARY);
+                Class.forName(DFU_JSON_OPS);
                 supported = true;
             } catch (Throwable t) {
                 supported = false;
@@ -190,15 +210,13 @@ public final class MaintenanceDialog {
                 continue;
             }
 
-            String listenerName = listener.getClass().getName();
-
-            if (CLASS_CONFIGURATION_LISTENER.equals(listenerName)) {
+            if (isConfigurationListener(listener)) {
                 if (pending.dispatched.compareAndSet(false, true)) {
                     dispatchDialog(serverHandle, connection, listener);
                 }
-            } else if (listenerName.contains("ServerGamePacketListener")) {
+            } else if (isPlayerOnline(server, pending.profile)) {
                 // Safety net: the player somehow made it into the game while maintenance denies them
-                disconnectPlayer(listener);
+                disconnectOnlinePlayer(server, pending.profile);
                 PENDING.remove(pending.address);
             }
         }
@@ -215,8 +233,8 @@ public final class MaintenanceDialog {
 
     private static Object findConnection(Object serverHandle, PendingDialog pending) {
         try {
-            Object connectionListener = serverHandle.getClass().getMethod("getConnection").invoke(serverHandle);
-            List<?> connections = (List<?>) connectionListener.getClass().getMethod("getConnections").invoke(connectionListener);
+            Object connectionListener = findMethod(serverHandle.getClass(), METHOD_GET_CONNECTION, METHOD_GET_CONNECTION_INTERMEDIARY).invoke(serverHandle);
+            List<?> connections = (List<?>) findMethod(connectionListener.getClass(), "getConnections", METHOD_GET_CONNECTIONS_INTERMEDIARY).invoke(connectionListener);
 
             if (connections == null) {
                 return null;
@@ -224,7 +242,7 @@ public final class MaintenanceDialog {
 
             if (pending.address != null) {
                 for (Object connection : connections) {
-                    Object address = connection.getClass().getMethod("getRemoteAddress").invoke(connection);
+                    Object address = findMethod(connection.getClass(), METHOD_GET_REMOTE_ADDRESS, METHOD_GET_REMOTE_ADDRESS_INTERMEDIARY).invoke(connection);
                     if (pending.address.equals(address)) {
                         return connection;
                     }
@@ -234,8 +252,7 @@ public final class MaintenanceDialog {
             // Fallback for proxies/weird addresses: match the game profile of configuration listeners
             for (Object connection : connections) {
                 Object listener = getPacketListener(connection);
-                if (listener != null && CLASS_CONFIGURATION_LISTENER.equals(listener.getClass().getName())
-                        && matchesProfile(listener, pending.profile)) {
+                if (listener != null && isConfigurationListener(listener) && matchesProfile(listener, pending.profile)) {
                     return connection;
                 }
             }
@@ -250,16 +267,47 @@ public final class MaintenanceDialog {
 
     private static Object getPacketListener(Object connection) {
         try {
-            return connection.getClass().getMethod("getPacketListener").invoke(connection);
+            return findMethod(connection.getClass(), METHOD_GET_PACKET_LISTENER, METHOD_GET_PACKET_LISTENER_INTERMEDIARY).invoke(connection);
         } catch (Throwable t) {
             return null;
         }
     }
 
+    private static boolean isConfigurationListener(Object listener) {
+        String name = listener.getClass().getName();
+        return CLASS_CONFIGURATION_LISTENER.equals(name) || CLASS_CONFIGURATION_LISTENER_INTERMEDIARY.equals(name);
+    }
+
+    private static boolean isPlayerOnline(CraterGameServer server, CraterGameProfile profile) {
+        try {
+            return server.getPlayers().stream()
+                    .anyMatch(player -> profile.getId() != null && profile.getId().equals(player.getUUID()));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void disconnectOnlinePlayer(CraterGameServer server, CraterGameProfile profile) {
+        try {
+            server.getPlayers().stream()
+                    .filter(player -> profile.getId() != null && profile.getId().equals(player.getUUID()))
+                    .findFirst()
+                    .ifPresent(player -> player.disconnect(Text.formatted(getMaintenanceMessage())));
+        } catch (Throwable t) {
+            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
+                ModConstants.LOG.error("Failed to disconnect player without dialog support", t);
+            }
+        }
+    }
+
     private static boolean matchesProfile(Object listener, CraterGameProfile profile) {
         try {
-            Field field = listener.getClass().getDeclaredField("gameProfile");
-            field.setAccessible(true);
+            Field field = findFieldByType(listener.getClass(), Class.forName(CLASS_GAME_PROFILE));
+
+            if (field == null) {
+                return false;
+            }
+
             Object gameProfile = field.get(listener);
 
             if (gameProfile == null) {
@@ -293,7 +341,8 @@ public final class MaintenanceDialog {
 
         executeOnServer(serverHandle, () -> {
             try {
-                Method send = connection.getClass().getMethod("send", Class.forName(CLASS_PACKET));
+                Class<?> packetClass = resolveClass(CLASS_PACKET, CLASS_PACKET_INTERMEDIARY);
+                Method send = findMethod(connection.getClass(), METHOD_SEND, METHOD_SEND_INTERMEDIARY, packetClass);
                 send.invoke(connection, packet);
                 clearConfigurationTasks(listener);
             } catch (Throwable t) {
@@ -302,21 +351,13 @@ public final class MaintenanceDialog {
         });
     }
 
-    private static void disconnectPlayer(Object listener) {
-        try {
-            Object message = Text.formatted(getMaintenanceMessage()).toGame();
-            Method disconnect = listener.getClass().getMethod("disconnect", Class.forName(CLASS_COMPONENT));
-            disconnect.invoke(listener, message);
-        } catch (Throwable t) {
-            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
-                ModConstants.LOG.error("Failed to disconnect player without dialog support", t);
-            }
-        }
-    }
-
     private static void clearConfigurationTasks(Object listener) throws Exception {
-        Field field = listener.getClass().getDeclaredField("configurationTasks");
-        field.setAccessible(true);
+        Field field = findFieldByType(listener.getClass(), Queue.class);
+
+        if (field == null) {
+            throw new NoSuchFieldException("configurationTasks");
+        }
+
         Queue<?> tasks = (Queue<?>) field.get(listener);
 
         if (tasks != null) {
@@ -333,18 +374,17 @@ public final class MaintenanceDialog {
     }
 
     private static Object createDialogPacket() throws Exception {
-        Object dialogTag = buildDialogTag();
+        Class<?> dialogClass = resolveClass(CLASS_DIALOG, CLASS_DIALOG_INTERMEDIARY);
+        Class<?> holderClass = resolveClass(CLASS_HOLDER, CLASS_HOLDER_INTERMEDIARY);
 
-        Object dialogCodec = Class.forName(CLASS_DIALOG).getField("CODEC").get(null);
-        Object nbtOps = Class.forName(CLASS_NBT_OPS).getField("INSTANCE").get(null);
-        Method parse = Class.forName(CLASS_DECODER).getMethod("parse", Class.forName(CLASS_DYNAMIC_OPS), Object.class);
-        Object result = parse.invoke(dialogCodec, nbtOps, dialogTag);
-        Object holder = Class.forName(CLASS_DATA_RESULT).getMethod("getOrThrow").invoke(result);
+        Object codec = findDialogCodec(dialogClass, holderClass);
+        Object holder = parse(codec, buildDialogJson());
 
-        return Class.forName(CLASS_SHOW_DIALOG_PACKET).getConstructor(Class.forName(CLASS_HOLDER)).newInstance(holder);
+        Class<?> packetClass = resolveClass(CLASS_SHOW_DIALOG_PACKET, CLASS_SHOW_DIALOG_PACKET_INTERMEDIARY);
+        return packetClass.getConstructor(holderClass).newInstance(holder);
     }
 
-    private static Object buildDialogTag() throws Exception {
+    private static JsonObject buildDialogJson() {
         MaintenanceModeConfig config = MaintenanceModeConfig.INSTANCE;
         String title = config.getDialogTitle() == null || config.getDialogTitle().isEmpty()
                 ? "Server is currently in maintenance mode" : config.getDialogTitle();
@@ -352,34 +392,35 @@ public final class MaintenanceDialog {
         List<MaintenanceModeConfig.DialogLink> links = config.getDialogLinks() == null
                 ? List.of() : config.getDialogLinks().stream().filter(MaintenanceDialog::validLink).toList();
 
-        Object dialog = newCompoundTag();
-        putString(dialog, "type", links.isEmpty() ? "minecraft:notice" : "minecraft:multi_action");
-        putTag(dialog, "title", encodeComponent(Text.formatted(title).toGame()));
+        JsonObject dialog = new JsonObject();
+        dialog.addProperty("type", links.isEmpty() ? "minecraft:notice" : "minecraft:multi_action");
+        dialog.add("title", Text.formatted(title).toJson());
 
-        Object body = newListTag();
-        Object plainMessage = newCompoundTag();
-        putString(plainMessage, "type", "minecraft:plain_message");
-        putTag(plainMessage, "contents", encodeComponent(Text.formatted(getMaintenanceMessage()).toGame()));
-        putInt(plainMessage, "width", 300);
-        addToList(body, plainMessage);
-        putTag(dialog, "body", body);
+        JsonObject plainMessage = new JsonObject();
+        plainMessage.addProperty("type", "minecraft:plain_message");
+        plainMessage.add("contents", Text.formatted(getMaintenanceMessage()).toJson());
+        plainMessage.addProperty("width", 300);
+
+        JsonArray body = new JsonArray();
+        body.add(plainMessage);
+        dialog.add("body", body);
 
         if (!links.isEmpty()) {
-            Object actions = newListTag();
+            JsonArray actions = new JsonArray();
 
             for (MaintenanceModeConfig.DialogLink link : links) {
-                Object button = newCompoundTag();
-                putTag(button, "label", encodeComponent(Text.formatted(link.getLabel()).toGame()));
+                JsonObject action = new JsonObject();
+                action.addProperty("type", "minecraft:open_url");
+                action.addProperty("url", link.getUrl());
 
-                Object action = newCompoundTag();
-                putString(action, "type", "minecraft:open_url");
-                putString(action, "url", link.getUrl());
+                JsonObject button = new JsonObject();
+                button.add("label", Text.formatted(link.getLabel()).toJson());
+                button.add("action", action);
 
-                putTag(button, "action", action);
-                addToList(actions, button);
+                actions.add(button);
             }
 
-            putTag(dialog, "actions", actions);
+            dialog.add("actions", actions);
         }
 
         return dialog;
@@ -410,38 +451,73 @@ public final class MaintenanceDialog {
         return message;
     }
 
-    private static Object encodeComponent(Object component) throws Exception {
-        Object codec = Class.forName(CLASS_COMPONENT_SERIALIZATION).getField("CODEC").get(null);
-        Object nbtOps = Class.forName(CLASS_NBT_OPS).getField("INSTANCE").get(null);
-        Method encodeStart = Class.forName(CLASS_ENCODER).getMethod("encodeStart", Class.forName(CLASS_DYNAMIC_OPS), Object.class);
-        Object result = encodeStart.invoke(codec, nbtOps, component);
+    private static Object findDialogCodec(Class<?> dialogClass, Class<?> holderClass) throws Exception {
+        Class<?> codecClass = Class.forName(DFU_CODEC);
 
-        return Class.forName(CLASS_DATA_RESULT).getMethod("getOrThrow").invoke(result);
+        for (Field field : dialogClass.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) || field.getType() != codecClass) {
+                continue;
+            }
+
+            Type genericType = field.getGenericType();
+
+            if (!(genericType instanceof ParameterizedType codecType) || codecType.getActualTypeArguments().length != 1) {
+                continue;
+            }
+
+            Type argument = codecType.getActualTypeArguments()[0];
+
+            if (!(argument instanceof ParameterizedType holderType) || holderType.getRawType() != holderClass) {
+                continue;
+            }
+
+            Type[] holderArguments = holderType.getActualTypeArguments();
+
+            if (holderArguments.length != 1 || holderArguments[0] != dialogClass) {
+                continue;
+            }
+
+            field.setAccessible(true);
+            return field.get(null);
+        }
+
+        throw new NoSuchFieldException("Dialog.CODEC");
     }
 
-    private static Object newCompoundTag() throws Exception {
-        return Class.forName(CLASS_COMPOUND_TAG).getConstructor().newInstance();
+    private static Object parse(Object codec, Object json) throws Exception {
+        Class<?> dynamicOpsClass = Class.forName(DFU_DYNAMIC_OPS);
+        Object jsonOps = Class.forName(DFU_JSON_OPS).getField("INSTANCE").get(null);
+        Method parse = Class.forName(DFU_DECODER).getMethod("parse", dynamicOpsClass, Object.class);
+        Object result = parse.invoke(codec, jsonOps, json);
+
+        return Class.forName(DFU_DATA_RESULT).getMethod("getOrThrow").invoke(result);
     }
 
-    private static Object newListTag() throws Exception {
-        return Class.forName(CLASS_LIST_TAG).getConstructor().newInstance();
+    private static Class<?> resolveClass(String officialName, String intermediaryName) throws ClassNotFoundException {
+        try {
+            return Class.forName(officialName);
+        } catch (ClassNotFoundException e) {
+            return Class.forName(intermediaryName);
+        }
     }
 
-    private static void putString(Object compound, String key, String value) throws Exception {
-        Class.forName(CLASS_COMPOUND_TAG).getMethod("putString", String.class, String.class).invoke(compound, key, value);
+    private static Method findMethod(Class<?> owner, String officialName, String intermediaryName, Class<?>... parameters) throws NoSuchMethodException {
+        try {
+            return owner.getMethod(officialName, parameters);
+        } catch (NoSuchMethodException e) {
+            return owner.getMethod(intermediaryName, parameters);
+        }
     }
 
-    private static void putInt(Object compound, String key, int value) throws Exception {
-        Class.forName(CLASS_COMPOUND_TAG).getMethod("putInt", String.class, int.class).invoke(compound, key, value);
-    }
+    private static Field findFieldByType(Class<?> owner, Class<?> type) {
+        for (Field field : owner.getDeclaredFields()) {
+            if (field.getType() == type) {
+                field.setAccessible(true);
+                return field;
+            }
+        }
 
-    private static void putTag(Object compound, String key, Object value) throws Exception {
-        Class.forName(CLASS_COMPOUND_TAG).getMethod("put", String.class, Class.forName(CLASS_TAG)).invoke(compound, key, value);
-    }
-
-    private static void addToList(Object list, Object value) throws Exception {
-        int size = (int) list.getClass().getMethod("size").invoke(list);
-        list.getClass().getMethod("add", int.class, Class.forName(CLASS_TAG)).invoke(list, size, value);
+        return null;
     }
 
     private static final class PendingDialog {
