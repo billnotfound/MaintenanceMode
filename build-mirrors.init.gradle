@@ -1,0 +1,28 @@
+// Fast mirrors used by build.bat / build.sh.
+// Pass this file to Gradle with: --init-script build-mirrors.init.gradle
+//
+// The official Gradle Plugin Portal and Maven Central are very slow or
+// unreachable from some networks, so the mirrors below are added in front
+// of the normal repositories. If an artifact is not found on a mirror,
+// Gradle automatically falls back to the repositories defined in build.gradle.
+
+beforeSettings { settings ->
+    settings.pluginManagement {
+        repositories {
+            maven { url = 'https://maven.aliyun.com/repository/public' }
+            maven { url = 'https://maven.minecraftforge.net/' }
+            maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+            maven { url = 'https://maven.firstdarkdev.xyz/releases' }
+            maven { url = 'https://maven.firstdarkdev.xyz/snapshots' }
+        }
+    }
+}
+
+allprojects {
+    repositories {
+        maven { url = 'https://maven.aliyun.com/repository/public' }
+        maven { url = 'https://maven.minecraftforge.net/' }
+        maven { url = 'https://maven.firstdarkdev.xyz/releases' }
+        maven { url = 'https://maven.firstdarkdev.xyz/snapshots' }
+    }
+}
