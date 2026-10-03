@@ -11,4 +11,4 @@
 - `useDialog` config option (default `true`) - Show the maintenance message as a dialog instead of a plain kick message
 - `dialogTitle` config option - Title of the maintenance dialog
 - `dialogLinks` config option - Buttons with clickable links shown in the dialog, each with a `label` and `url`
-- `dialogTimeout` config option (default `120` seconds) - Disconnect players that keep the dialog open for too long. Set to `0` to hold the connection until the dialog is closed
+- `dialogTimeout` config option (default `30` seconds) - Disconnect players that keep the dialog open for too long. Set to `0` to hold the connection until the dialog is closed

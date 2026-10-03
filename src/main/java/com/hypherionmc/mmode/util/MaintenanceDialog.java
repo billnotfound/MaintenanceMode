@@ -406,6 +406,11 @@ public final class MaintenanceDialog {
 
                         if (CLASS_CUSTOM_ACTION_PACKET.equals(packetClass) || CLASS_CUSTOM_ACTION_PACKET_INTERMEDIARY.equals(packetClass)) {
                             ctx.pipeline().remove(this);
+
+                            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
+                                ModConstants.LOG.info("Maintenance dialog closed by the player, disconnecting");
+                            }
+
                             onDialogClosed(serverHandle, pending);
                         }
                     } catch (Throwable ignored) {
@@ -441,9 +446,7 @@ public final class MaintenanceDialog {
             Method disconnect = findMethod(listener.getClass(), METHOD_DISCONNECT, METHOD_DISCONNECT_INTERMEDIARY, componentClass);
             disconnect.invoke(listener, Text.formatted(getMaintenanceMessage()).toGame());
         } catch (Throwable t) {
-            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
-                ModConstants.LOG.error("Failed to disconnect player after closing the maintenance dialog", t);
-            }
+            ModConstants.LOG.error("Failed to disconnect player after closing the maintenance dialog: {}", t.getMessage());
         }
     }
 
