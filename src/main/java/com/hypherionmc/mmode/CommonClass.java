@@ -70,6 +70,9 @@ public final class CommonClass {
                     if (MaintenanceDialog.hold(mcServer, event.getGameProfile(), event.getAddress()))
                         return;
 
+                    // The configuration finished (second pre-login check), kick the player normally
+                    MaintenanceDialog.forget(event.getAddress());
+
                     String message = MaintenanceModeConfig.INSTANCE.getMessage();
                     if (message == null || message.isEmpty())
                         message = "Server is currently undergoing maintenance. Please try connecting again later";

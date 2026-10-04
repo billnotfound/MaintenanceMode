@@ -37,8 +37,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Discord/website links directly from the maintenance screen.
  * <p>
  * The player is allowed through the login phase and held in the configuration phase, where the
- * dialog is displayed and the configuration is never completed. On Minecraft versions without
- * dialog support everything falls back to the old text kick.
+ * dialog is displayed. The JoinWorldTask is held back, so the configuration is not finished
+ * until the player closes the dialog (or the timeout expires). Once it is released, the client
+ * finishes joining and the second pre-login check kicks the player before they are spawned into
+ * the world. On Minecraft versions without dialog support everything falls back to the old text
+ * kick.
  * <p>
  * Every Minecraft class is accessed by name through reflection, so this class is safe to load on
  * old versions where dialogs do not exist. Official (Mojang) class and method names are used
@@ -57,6 +60,8 @@ public final class MaintenanceDialog {
     private static final String CLASS_PACKET_INTERMEDIARY = "net.minecraft.class_2596";
     private static final String CLASS_CONFIGURATION_LISTENER = "net.minecraft.server.network.ServerConfigurationPacketListenerImpl";
     private static final String CLASS_CONFIGURATION_LISTENER_INTERMEDIARY = "net.minecraft.class_8610";
+    private static final String CLASS_JOIN_WORLD_TASK = "net.minecraft.server.network.config.JoinWorldTask";
+    private static final String CLASS_JOIN_WORLD_TASK_INTERMEDIARY = "net.minecraft.class_8611";
 
     private static final String METHOD_GET_CONNECTION = "getConnection";
     private static final String METHOD_GET_CONNECTION_INTERMEDIARY = "method_3787";
@@ -69,6 +74,8 @@ public final class MaintenanceDialog {
     private static final String METHOD_SEND_INTERMEDIARY = "method_10743";
     private static final String METHOD_DISCONNECT = "disconnect";
     private static final String METHOD_DISCONNECT_INTERMEDIARY = "method_52396";
+    private static final String METHOD_START_NEXT_TASK = "startNextTask";
+    private static final String METHOD_START_NEXT_TASK_INTERMEDIARY = "method_52412";
 
     private static final String CLASS_GAME_PROFILE = "com.mojang.authlib.GameProfile";
     private static final String CLASS_COMPONENT = "net.minecraft.network.chat.Component";
@@ -87,6 +94,7 @@ public final class MaintenanceDialog {
     private static final String DFU_DATA_RESULT = "com.mojang.serialization.DataResult";
 
     private static final long WAIT_TIMEOUT_MS = 30000L;
+    private static final long FINISH_TIMEOUT_MS = 10000L;
     private static final long POLL_INTERVAL_MS = 25L;
 
     private static final Object LOCK = new Object();
@@ -159,6 +167,15 @@ public final class MaintenanceDialog {
         }
     }
 
+    /**
+     * Removes a pending dialog entry. Called when the second pre-login check kicks the player.
+     */
+    public static void forget(SocketAddress address) {
+        if (address != null) {
+            PENDING.remove(address);
+        }
+    }
+
     private static void ensureWatcher(CraterGameServer server) {
         if (watcher == null || watcher.isShutdown()) {
             watcher = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -206,9 +223,23 @@ public final class MaintenanceDialog {
 
         for (PendingDialog pending : PENDING.values()) {
             if (pending.dispatched.get()) {
+                if (pending.finishing.get()) {
+                    // The configuration is finishing. If the client never completes it, disconnect directly
+                    if (now >= pending.finishDeadline) {
+                        disconnectHeldConnection(pending);
+                        PENDING.remove(pending.address);
+                    }
+                    continue;
+                }
+
+                if (!stillDenied(pending)) {
+                    // Maintenance was disabled while the player was held, let them through
+                    finishHeldConnection(serverHandle, pending);
+                    continue;
+                }
+
                 if (now >= pending.kickAt) {
-                    disconnectHeldConnection(pending);
-                    PENDING.remove(pending.address);
+                    finishHeldConnection(serverHandle, pending);
                 }
                 continue;
             }
@@ -362,7 +393,10 @@ public final class MaintenanceDialog {
                 Class<?> packetClass = resolveClass(CLASS_PACKET, CLASS_PACKET_INTERMEDIARY);
                 Method send = findMethod(connection.getClass(), METHOD_SEND, METHOD_SEND_INTERMEDIARY, packetClass);
                 send.invoke(connection, packet);
-                clearConfigurationTasks(listener);
+
+                // Hold back the JoinWorldTask, so the configuration never finishes until the
+                // player closes the dialog (or the timeout expires)
+                holdConfiguration(listener, pending);
 
                 pending.connection = connection;
                 pending.listener = listener;
@@ -408,10 +442,10 @@ public final class MaintenanceDialog {
                             ctx.pipeline().remove(this);
 
                             if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
-                                ModConstants.LOG.info("Maintenance dialog closed by the player, disconnecting");
+                                ModConstants.LOG.info("Maintenance dialog closed by the player, finishing configuration");
                             }
 
-                            onDialogClosed(serverHandle, pending);
+                            finishHeldConnection(serverHandle, pending);
                         }
                     } catch (Throwable ignored) {
                     }
@@ -426,10 +460,46 @@ public final class MaintenanceDialog {
         }
     }
 
-    private static void onDialogClosed(Object serverHandle, PendingDialog pending) {
+    /**
+     * Releases the held configuration, so the client can finish joining. The second pre-login
+     * check in the server then kicks the player before they are actually spawned into the world.
+     */
+    private static void finishHeldConnection(Object serverHandle, PendingDialog pending) {
+        if (!pending.finishing.compareAndSet(false, true)) {
+            return;
+        }
+
+        // Safety net in case the configuration never finishes
+        pending.finishDeadline = System.currentTimeMillis() + FINISH_TIMEOUT_MS;
+
         executeOnServer(serverHandle, () -> {
-            if (PENDING.remove(pending.address) != null) {
+            try {
+                Object listener = pending.listener;
+                Object task = pending.joinWorldTask;
+
+                if (listener == null) {
+                    return;
+                }
+
+                if (task != null) {
+                    Queue<Object> tasks = getConfigurationTaskQueue(listener);
+
+                    if (tasks != null && !tasks.contains(task)) {
+                        tasks.add(task);
+                    }
+
+                    // If no other configuration task is running, start the JoinWorldTask now.
+                    // Otherwise the current task will pick it up when it finishes.
+                    if (findCurrentTask(listener, task) == null) {
+                        findDeclaredMethod(listener.getClass(), METHOD_START_NEXT_TASK, METHOD_START_NEXT_TASK_INTERMEDIARY).invoke(listener);
+                    }
+                }
+
+                pending.finishDeadline = System.currentTimeMillis() + FINISH_TIMEOUT_MS;
+            } catch (Throwable t) {
+                ModConstants.LOG.error("Failed to finish the configuration phase for the maintenance dialog: {}", t.getMessage());
                 disconnectHeldConnection(pending);
+                PENDING.remove(pending.address);
             }
         });
     }
@@ -454,18 +524,54 @@ public final class MaintenanceDialog {
         }
     }
 
-    private static void clearConfigurationTasks(Object listener) throws Exception {
+    @SuppressWarnings("unchecked")
+    private static Queue<Object> getConfigurationTaskQueue(Object listener) throws Exception {
         Field field = findFieldByType(listener.getClass(), Queue.class);
 
         if (field == null) {
             throw new NoSuchFieldException("configurationTasks");
         }
 
-        Queue<?> tasks = (Queue<?>) field.get(listener);
+        return (Queue<Object>) field.get(listener);
+    }
 
-        if (tasks != null) {
-            tasks.clear();
+    /**
+     * Takes the JoinWorldTask out of the configuration task queue. Without it the server never
+     * sends the FinishConfiguration packet and the client stays in the configuration phase.
+     */
+    private static void holdConfiguration(Object listener, PendingDialog pending) throws Exception {
+        Queue<Object> tasks = getConfigurationTaskQueue(listener);
+
+        if (tasks == null) {
+            throw new NoSuchFieldException("configurationTasks");
         }
+
+        for (Object task : tasks) {
+            if (isJoinWorldTask(task)) {
+                if (tasks.remove(task)) {
+                    pending.joinWorldTask = task;
+                }
+                return;
+            }
+        }
+    }
+
+    private static boolean isJoinWorldTask(Object task) {
+        String name = task.getClass().getName();
+        return CLASS_JOIN_WORLD_TASK.equals(name) || CLASS_JOIN_WORLD_TASK_INTERMEDIARY.equals(name);
+    }
+
+    private static Object findCurrentTask(Object listener, Object task) throws Exception {
+        for (Field field : listener.getClass().getDeclaredFields()) {
+            Class<?> type = field.getType();
+
+            if (type.isInterface() && type.isInstance(task)) {
+                field.setAccessible(true);
+                return field.get(listener);
+            }
+        }
+
+        return null;
     }
 
     private static void executeOnServer(Object serverHandle, Runnable runnable) {
@@ -625,6 +731,18 @@ public final class MaintenanceDialog {
         }
     }
 
+    private static Method findDeclaredMethod(Class<?> owner, String officialName, String intermediaryName) throws NoSuchMethodException {
+        try {
+            Method method = owner.getDeclaredMethod(officialName);
+            method.setAccessible(true);
+            return method;
+        } catch (NoSuchMethodException e) {
+            Method method = owner.getDeclaredMethod(intermediaryName);
+            method.setAccessible(true);
+            return method;
+        }
+    }
+
     private static Field findFieldByType(Class<?> owner, Class<?> type) {
         for (Field field : owner.getDeclaredFields()) {
             if (field.getType() == type) {
@@ -641,9 +759,12 @@ public final class MaintenanceDialog {
         private final SocketAddress address;
         private final long deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS;
         private final AtomicBoolean dispatched = new AtomicBoolean(false);
+        private final AtomicBoolean finishing = new AtomicBoolean(false);
         private volatile Object connection;
         private volatile Object listener;
+        private volatile Object joinWorldTask;
         private volatile long kickAt = Long.MAX_VALUE;
+        private volatile long finishDeadline = Long.MAX_VALUE;
 
         private PendingDialog(CraterGameProfile profile, SocketAddress address) {
             this.profile = profile;
