@@ -444,7 +444,11 @@ public final class MaintenanceDialog {
 
             Class<?> componentClass = resolveClass(CLASS_COMPONENT, CLASS_COMPONENT_INTERMEDIARY);
             Method disconnect = findMethod(listener.getClass(), METHOD_DISCONNECT, METHOD_DISCONNECT_INTERMEDIARY, componentClass);
-            disconnect.invoke(listener, Text.formatted(getMaintenanceMessage()).toGame());
+
+            // Keep this as an Object variable! Passing toGame() directly to the varargs invoke()
+            // makes the compiler infer T as Object[] and crashes with a ClassCastException
+            Object message = Text.formatted(getMaintenanceMessage()).toGame();
+            disconnect.invoke(listener, message);
         } catch (Throwable t) {
             ModConstants.LOG.error("Failed to disconnect player after closing the maintenance dialog: {}", t.getMessage());
         }

@@ -6,6 +6,10 @@
 - The maintenance message is now shown as a native Minecraft dialog on Minecraft 1.21.6 and newer (including Fabric/Quilt), which allows clickable links. On older versions, the normal kick message is used
 - Closing the dialog now disconnects the player right away instead of leaving them stuck on the "Joining world" screen
 
+**Bug Fixes**:
+
+- Fixed the player not actually being disconnected when closing the dialog or when the dialog timeout expired (the disconnect call crashed with a ClassCastException)
+
 **New Features**:
 
 - `useDialog` config option (default `true`) - Show the maintenance message as a dialog instead of a plain kick message
