@@ -62,6 +62,8 @@ public final class MaintenanceDialog {
     private static final String CLASS_CONFIGURATION_LISTENER_INTERMEDIARY = "net.minecraft.class_8610";
     private static final String CLASS_JOIN_WORLD_TASK = "net.minecraft.server.network.config.JoinWorldTask";
     private static final String CLASS_JOIN_WORLD_TASK_INTERMEDIARY = "net.minecraft.class_8611";
+    private static final String CLASS_CLEAR_DIALOG_PACKET = "net.minecraft.network.protocol.common.ClientboundClearDialogPacket";
+    private static final String CLASS_CLEAR_DIALOG_PACKET_INTERMEDIARY = "net.minecraft.class_11406";
 
     private static final String METHOD_GET_CONNECTION = "getConnection";
     private static final String METHOD_GET_CONNECTION_INTERMEDIARY = "method_3787";
@@ -86,6 +88,8 @@ public final class MaintenanceDialog {
     private static final String CHANNEL_HANDLER_NAME = "packet_handler";
     private static final String CLOSE_PROBE_NAME = "mmode_dialog_close";
     private static final String CLOSE_ACTION_ID = "mmode:close";
+    private static final String FIELD_INSTANCE = "INSTANCE";
+    private static final String FIELD_INSTANCE_INTERMEDIARY = "field_60602";
 
     private static final String DFU_CODEC = "com.mojang.serialization.Codec";
     private static final String DFU_DECODER = "com.mojang.serialization.Decoder";
@@ -94,7 +98,7 @@ public final class MaintenanceDialog {
     private static final String DFU_DATA_RESULT = "com.mojang.serialization.DataResult";
 
     private static final long WAIT_TIMEOUT_MS = 30000L;
-    private static final long FINISH_TIMEOUT_MS = 10000L;
+    private static final long FINISH_TIMEOUT_MS = 5000L;
     private static final long POLL_INTERVAL_MS = 25L;
 
     private static final Object LOCK = new Object();
@@ -226,6 +230,7 @@ public final class MaintenanceDialog {
                 if (pending.finishing.get()) {
                     // The configuration is finishing. If the client never completes it, disconnect directly
                     if (now >= pending.finishDeadline) {
+                        ModConstants.LOG.info("The configuration for {} did not finish in time, disconnecting", pending.profile.getName());
                         disconnectHeldConnection(pending);
                         PENDING.remove(pending.address);
                     }
@@ -440,11 +445,7 @@ public final class MaintenanceDialog {
 
                         if (CLASS_CUSTOM_ACTION_PACKET.equals(packetClass) || CLASS_CUSTOM_ACTION_PACKET_INTERMEDIARY.equals(packetClass)) {
                             ctx.pipeline().remove(this);
-
-                            if (MaintenanceModeConfig.INSTANCE != null && MaintenanceModeConfig.INSTANCE.isDebug()) {
-                                ModConstants.LOG.info("Maintenance dialog closed by the player, finishing configuration");
-                            }
-
+                            ModConstants.LOG.info("Maintenance dialog closed by {}, releasing the configuration", pending.profile.getName());
                             finishHeldConnection(serverHandle, pending);
                         }
                     } catch (Throwable ignored) {
@@ -481,6 +482,10 @@ public final class MaintenanceDialog {
                     return;
                 }
 
+                // Close the dialog on the client first, so the client is back on its normal
+                // joining screen when the connection is released and kicked
+                clearDialog(pending.connection);
+
                 if (task != null) {
                     Queue<Object> tasks = getConfigurationTaskQueue(listener);
 
@@ -496,12 +501,32 @@ public final class MaintenanceDialog {
                 }
 
                 pending.finishDeadline = System.currentTimeMillis() + FINISH_TIMEOUT_MS;
+                ModConstants.LOG.info("Releasing the configuration for {} so the player can be kicked", pending.profile.getName());
             } catch (Throwable t) {
                 ModConstants.LOG.error("Failed to finish the configuration phase for the maintenance dialog: {}", t.getMessage());
                 disconnectHeldConnection(pending);
                 PENDING.remove(pending.address);
             }
         });
+    }
+
+    /**
+     * Sends ClientboundClearDialogPacket, so the client closes the dialog and returns to the
+     * normal joining screen before it gets disconnected.
+     */
+    private static void clearDialog(Object connection) {
+        if (connection == null) {
+            return;
+        }
+
+        try {
+            Class<?> packetClass = resolveClass(CLASS_CLEAR_DIALOG_PACKET, CLASS_CLEAR_DIALOG_PACKET_INTERMEDIARY);
+            Object packet = findDeclaredField(packetClass, FIELD_INSTANCE, FIELD_INSTANCE_INTERMEDIARY).get(null);
+            Class<?> packetBase = resolveClass(CLASS_PACKET, CLASS_PACKET_INTERMEDIARY);
+            findMethod(connection.getClass(), METHOD_SEND, METHOD_SEND_INTERMEDIARY, packetBase).invoke(connection, packet);
+        } catch (Throwable t) {
+            ModConstants.LOG.error("Failed to clear the maintenance dialog: {}", t.getMessage());
+        }
     }
 
     private static void disconnectHeldConnection(PendingDialog pending) {
@@ -511,6 +536,9 @@ public final class MaintenanceDialog {
             if (listener == null) {
                 return;
             }
+
+            // Make sure the client is not stuck on the dialog screen when it gets disconnected
+            clearDialog(pending.connection);
 
             Class<?> componentClass = resolveClass(CLASS_COMPONENT, CLASS_COMPONENT_INTERMEDIARY);
             Method disconnect = findMethod(listener.getClass(), METHOD_DISCONNECT, METHOD_DISCONNECT_INTERMEDIARY, componentClass);
@@ -740,6 +768,18 @@ public final class MaintenanceDialog {
             Method method = owner.getDeclaredMethod(intermediaryName);
             method.setAccessible(true);
             return method;
+        }
+    }
+
+    private static Field findDeclaredField(Class<?> owner, String officialName, String intermediaryName) throws NoSuchFieldException {
+        try {
+            Field field = owner.getDeclaredField(officialName);
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException e) {
+            Field field = owner.getDeclaredField(intermediaryName);
+            field.setAccessible(true);
+            return field;
         }
     }
 
